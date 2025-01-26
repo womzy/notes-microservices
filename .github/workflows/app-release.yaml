@@ -1,0 +1,105 @@
+name: Build and deploy Notes Microservices app and deploy tf k8s
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      FRONTEND_IMAGE: ${{ steps.set-env.outputs.FRONTEND_IMAGE }}
+      BACKEND_IMAGE: ${{ steps.set-env.outputs.BACKEND_IMAGE }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: 'Az CLI login OIDC'
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}  
+
+    - name: create on first run and login to ACR
+      run: |
+        az acr create -n  womzy-sample-acr -g automation-team-rg --sku Standard
+        az acr login --name womzy-sample-acr
+
+    - name: Build and push backend image
+      run: |
+        docker build --file ./app/Dockerfile.fastapi -t womzy-sample-acr.azurecr.io/backend:${{ github.sha }} ./app/
+        docker push womzy-sample-acr.azurecr.io/backend:${{ github.sha }}
+
+    - name: Build and push frontend image
+      run: |
+        docker build --file ./app/Dockerfile.streamlit_app -t womzy-sample-acr.azurecr.io/frontend:${{ github.sha }} ./app/
+        docker push womzy-sample-acr.azurecr.io/frontend:${{ github.sha }}
+
+    - name: set env
+      id: set-env
+      run: |      
+        echo "FRONTEND_IMAGE=womzy-sample-acr.azurecr.io/frontend:${{ github.sha }}" >> $GITHUB_OUTPUT
+        echo "BACKEND_IMAGE=womzy-sample-acr.azurecr.io/backend:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy-infra:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    env:
+      FRONTEND_IMAGE: ${{ needs.build-and-push.outputs.FRONTEND_IMAGE }}
+      BACKEND_IMAGE: ${{ needs.build-and-push.outputs.BACKEND_IMAGE }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create ACR Pull Token and Set Secrets
+        run: |
+          ACR_USERNAME="imagePullTokenSampleSetup"
+          az acr token create --name $ACR_USERNAME --registry womzy-sample-acr \
+          --repository backend \
+          metadata/read content/read  \
+          --repository frontend \
+          metadata/read content/read  
+
+          PASSWORD=$(az acr token credential generate \
+            --name $ACR_USERNAME \
+            --registry womzy-sample-acr \
+            --query "[passwords[0].value]" \
+            --output tsv)
+          echo "::add-mask::$PASSWORD"
+          echo ACR_USERNAME=$ACR_USERNAME >> $GITHUB_ENV
+          echo ACR_PULL_TOKEN=$PASSWORD >> $GITHUB_ENV
+          echo REGISTRY_NAME="womzy-sample-acr.azurecr.io" >> $GITHUB_ENV
+          az acr update -n womzy-sample-acr --admin-enabled true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+        # Terraform Initialization
+      - name: Terraform Init
+        working-directory: ./learn_infra/
+        run: terraform init
+
+      # Terraform Plan
+      - name: Terraform Plan
+        working-directory: ./learn_infra/
+        run: terraform plan -out=tfplan
+
+      # Terraform Apply
+      - name: Terraform Apply
+        working-directory: ./learn_infra/
+        run: terraform apply -auto-approve tfplan
+
