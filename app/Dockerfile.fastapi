@@ -1,0 +1,26 @@
+# Stage 1: Build the application
+FROM python:3.9-slim AS builder
+
+WORKDIR /app
+
+COPY requirements_fastapi.txt .
+
+RUN pip install --user -r requirements_fastapi.txt
+
+COPY fastapi_app.py .
+
+# Stage 2: Create the final image
+FROM python:3.9-slim AS final
+
+WORKDIR /app
+
+COPY --from=builder /root/.local /root/.local
+
+COPY --from=builder /app .
+
+ENV PATH=/root/.local/bin:$PATH
+
+EXPOSE 8000
+
+CMD ["uvicorn", "fastapi_app:app", "--host", "0.0.0.0", "--port", "8000"]
+
